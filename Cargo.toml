@@ -1,0 +1,17 @@
+[package]
+name = "otakudesu-api-rust"
+version = "1.0.0"
+edition = "2021"
+
+[dependencies]
+axum = "0.8"
+tokio = { version = "1", features = ["full"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "gzip", "brotli", "deflate"] }
+scraper = "0.23"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+base64 = "0.22"
+urlencoding = "2"
+tower-http = { version = "0.6", features = ["cors", "trace"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
