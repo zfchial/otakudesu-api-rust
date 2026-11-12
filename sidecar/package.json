@@ -1,0 +1,13 @@
+{
+  "name": "nanostream-bypass-sidecar",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Cloudflare bypass sidecar (omnify-bypass) untuk NanoStream API",
+  "main": "bypass-server.js",
+  "scripts": {
+    "start": "node bypass-server.js"
+  },
+  "dependencies": {
+    "omnify-bypass": "^1.0.8"
+  }
+}
