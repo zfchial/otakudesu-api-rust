@@ -396,6 +396,38 @@ pub async fn komik_genres(State(s): State<Arc<AppState>>) -> Response {
     }
 }
 
+fn title_case(slug: &str) -> String {
+    slug.split('-')
+        .map(|w| {
+            let mut c = w.chars();
+            match c.next() {
+                Some(f) => f.to_uppercase().collect::<String>() + c.as_str(),
+                None => String::new(),
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn genre_label(slug: &str) -> String {
+    match slug {
+        "traged" => "Tragedy".to_string(),
+        "life" => "Slice Of Life".to_string(),
+        "sci-fi" => "Sci-Fi".to_string(),
+        "shoujo" => "Shoujo".to_string(),
+        "shounen" => "Shounen".to_string(),
+        _ => title_case(slug),
+    }
+}
+
+fn genre_alias(slug: &str) -> Option<&'static str> {
+    match slug {
+        "traged" => Some("tragedy"),
+        "life" => Some("slice-of-life"),
+        _ => None,
+    }
+}
+
 async fn komik_genres_data(s: &AppState) -> Result<Value, String> {
     let html = fetch(s, &format!("{}/genres-sitemap.xml", KOMIK)).await?;
     let mut genres = Vec::new();
@@ -412,19 +444,17 @@ async fn komik_genres_data(s: &AppState) -> Result<Value, String> {
         if slug.is_empty() || !seen.insert(slug.clone()) {
             continue;
         }
-        let label = slug
-            .split('-')
-            .map(|w| {
-                let mut c = w.chars();
-                match c.next() {
-                    Some(f) => f.to_uppercase().collect::<String>() + c.as_str(),
-                    None => String::new(),
-                }
-            })
-            .collect::<Vec<_>>()
-            .join(" ");
-        genres.push(json!({"name": label, "slug": slug}));
+        if genre_alias(&slug).is_some() {
+            continue;
+        }
+        genres.push(json!({"name": genre_label(&slug), "slug": slug}));
     }
+    genres.sort_by(|a, b| {
+        a["name"]
+            .as_str()
+            .unwrap_or_default()
+            .cmp(b["name"].as_str().unwrap_or_default())
+    });
     Ok(json!({"genres": genres, "total": genres.len()}))
 }
 
@@ -450,6 +480,7 @@ async fn komik_by_genre_data(s: &AppState, q: &ComicQuery) -> Result<Value, Stri
     if slug.is_empty() || !slug.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') {
         return Err("Slug genre tidak valid".to_string());
     }
+    let slug = genre_alias(&slug).unwrap_or(&slug).to_string();
     let page = q.page.unwrap_or(1).max(1);
     let base = format!("{}/genres/{}/", KOMIK, slug);
     let url = if page > 1 {
@@ -459,17 +490,7 @@ async fn komik_by_genre_data(s: &AppState, q: &ComicQuery) -> Result<Value, Stri
     };
     let html = fetch(s, &url).await?;
     let doc = Html::parse_document(&html);
-    let label = slug
-        .split('-')
-        .map(|w| {
-            let mut c = w.chars();
-            match c.next() {
-                Some(f) => f.to_uppercase().collect::<String>() + c.as_str(),
-                None => String::new(),
-            }
-        })
-        .collect::<Vec<_>>()
-        .join(" ");
+    let label = genre_label(&slug);
     let mut items = Vec::new();
     let mut seen = std::collections::HashSet::new();
     for el in doc.select(&sel("div.animepost, article, div.bs, div.utao")) {
