@@ -7,7 +7,7 @@ use axum::{
 use scraper::{ElementRef, Html, Selector};
 use serde::Deserialize;
 use serde_json::{json, Value};
-use std::{sync::Arc, time::Duration};
+use std::{collections::HashSet, sync::Arc, time::Duration};
 use crate::{err, AppState};
 
 const SH_UA: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/135.0.0.0 Safari/537.36";
@@ -193,8 +193,26 @@ fn card_how_episode(li: ElementRef) -> Option<Value> {
     }))
 }
 
+fn in_sidebar(el: ElementRef) -> bool {
+    let mut found = false;
+    for node in el.ancestors().skip(1) {
+        if let Some(e) = ElementRef::wrap(node) {
+            let id = e.value().id().unwrap_or("");
+            if id == "sidebar" || id.contains("sidebar") {
+                found = true;
+                break;
+            }
+            if e.value().has_class("sidebar", scraper::CaseSensitivity::AsciiCaseInsensitive) {
+                found = true;
+                break;
+            }
+        }
+    }
+    found
+}
+
 fn cards(h: &Html, limit: usize) -> Vec<Value> {
-    let mut out: Vec<Value> = h.select(&sel("div.bsx")).filter_map(card_li).collect();
+    let mut out: Vec<Value> = h.select(&sel("div.bsx")).filter(|e| !in_sidebar(*e)).filter_map(card_li).collect();
     if out.is_empty() {
         out = h.select(&sel("article.animepost")).filter_map(card_how).collect();
     }
@@ -429,14 +447,92 @@ fn episode_how(h: &Html) -> Value {
     })
 }
 
-pub async fn episode_from_title(s: &AppState, title: &str) -> Result<Value, String> {
+fn norm_num_token(t: &str) -> Option<u32> {
+    if let Ok(n) = t.parse::<u32>() {
+        return Some(n);
+    }
+    match t {
+        "1st" | "first" => Some(1),
+        "2nd" | "second" => Some(2),
+        "3rd" | "third" => Some(3),
+        "4th" | "fourth" => Some(4),
+        "5th" | "fifth" => Some(5),
+        "ii" => Some(2),
+        "iii" => Some(3),
+        "iv" => Some(4),
+        "v" => Some(5),
+        _ => None,
+    }
+}
+
+fn title_key(title: &str) -> (Vec<String>, Option<u32>) {
+    let low = title.to_lowercase();
+    let tokens: Vec<String> = low
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .collect();
+    let mut out: Vec<String> = Vec::new();
+    let mut season: Option<u32> = None;
+    let mut i = 0;
+    while i < tokens.len() {
+        let t = tokens[i].as_str();
+        let is_season_word = matches!(t, "season" | "seasons" | "s" | "part" | "parts");
+        if is_season_word {
+            if let Some(n) = tokens.get(i + 1).and_then(|x| norm_num_token(x)) {
+                season = Some(n);
+                i += 2;
+                continue;
+            }
+            i += 1;
+            continue;
+        }
+        if let Some(n) = norm_num_token(t) {
+            let next_is_season = tokens.get(i + 1).map(|x| matches!(x.as_str(), "season" | "seasons" | "part" | "parts")).unwrap_or(false);
+            if next_is_season && season.is_none() {
+                season = Some(n);
+                i += 2;
+                continue;
+            }
+            if season.is_none() && i + 1 == tokens.len() && !out.is_empty() {
+                if matches!(t, "ii" | "iii" | "iv" | "v" | "vi" | "vii" | "viii") {
+                    season = Some(n);
+                    i += 1;
+                    continue;
+                }
+            }
+        }
+        out.push(t.to_string());
+        i += 1;
+    }
+    (out, season)
+}
+
+fn similarity(a: &str, b: &str) -> f64 {
+    let (ta, _) = title_key(a);
+    let (tb, _) = title_key(b);
+    if ta.is_empty() || tb.is_empty() {
+        return 0.0;
+    }
+    let sa: HashSet<&String> = ta.iter().collect();
+    let sb: HashSet<&String> = tb.iter().collect();
+    let inter = sa.intersection(&sb).count() as f64;
+    let union = sa.union(&sb).count() as f64;
+    if union == 0.0 {
+        return 0.0;
+    }
+    inter / union
+}
+
+fn parse_episode_title(title: &str) -> (String, u64, String) {
     let clean = title
         .replace("Subtitle Indonesia", "")
+        .replace("Subtitle Indo", "")
         .replace("Sub Indo", "")
         .trim()
         .to_string();
-
-    let (name, num) = match clean.rfind(" Episode ") {
+    let low = clean.to_lowercase();
+    match low.rfind(" episode ") {
         Some(i) => {
             let tail = &clean[i + 9..];
             let n = tail
@@ -444,48 +540,164 @@ pub async fn episode_from_title(s: &AppState, title: &str) -> Result<Value, Stri
                 .find(|x| !x.is_empty())
                 .and_then(|x| x.parse::<u64>().ok())
                 .unwrap_or(0);
-            (clean[..i].trim().to_string(), n)
+            (clean[..i].trim().to_string(), n, tail.trim().to_string())
         }
-        None => (clean.clone(), 0),
+        None => (clean.clone(), 0, String::new()),
+    }
+}
+
+fn search_queries(name: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let mut push = |v: String, out: &mut Vec<String>| {
+        let v = v.trim().to_string();
+        if v.len() > 2 && !out.iter().any(|x| x.eq_ignore_ascii_case(&v)) {
+            out.push(v);
+        }
     };
+    push(name.to_string(), &mut out);
+    let (tokens, _) = title_key(name);
+    if !tokens.is_empty() {
+        push(tokens.join(" "), &mut out);
+        let short: Vec<String> = tokens.iter().take(6).cloned().collect();
+        push(short.join(" "), &mut out);
+        let head: Vec<String> = tokens.iter().take(4).cloned().collect();
+        push(head.join(" "), &mut out);
+    }
+    out
+}
+
+async fn search_candidates(s: &AppState, queries: &[String]) -> Vec<Value> {
+    let mut out: Vec<Value> = Vec::new();
+    let mut seen: HashSet<String> = HashSet::new();
+    for q in queries {
+        let url = format!("{}/?s={}", base(), urlencoding::encode(q));
+        let h = match get_html(s, &url).await {
+            Ok(h) => h,
+            Err(_) => continue,
+        };
+        for c in cards(&h, 25) {
+            let u = c["url"].as_str().unwrap_or("").to_string();
+            if u.is_empty() || !seen.insert(u.clone()) {
+                continue;
+            }
+            out.push(c);
+        }
+    }
+    out
+}
+
+pub async fn episode_from_title(s: &AppState, title: &str) -> Result<Value, String> {
+    let (name, num, _) = parse_episode_title(title);
     if name.is_empty() {
         return Err("Judul anime tidak dapat dibaca".to_string());
     }
+    let (_, want_season) = title_key(&name);
 
-    let search_url = format!("{}/?s={}", base(), urlencoding::encode(&name));
-    let anime_url = {
-        let sh = get_html(s, &search_url).await.map_err(|e| format!("pencarian Samehadaku gagal: {e}"))?;
-        cards(&sh, 1).first().and_then(|c| c["url"].as_str().map(str::to_string))
-            .ok_or_else(|| format!("anime \"{name}\" tidak ditemukan di Samehadaku"))?
-    };
+    let queries = search_queries(&name);
+    let candidates = search_candidates(s, &queries).await;
+    if candidates.is_empty() {
+        return Err(format!("anime \"{name}\" tidak ditemukan di Samehadaku"));
+    }
 
-    let (ep_url, matched) = {
-        let ah = get_html(s, &anime_url).await.map_err(|e| format!("halaman anime Samehadaku gagal: {e}"))?;
+    let mut ranked: Vec<(f64, Value)> = candidates
+        .iter()
+        .filter_map(|c| {
+            let t = c["title"].as_str().unwrap_or("");
+            if t.is_empty() {
+                return None;
+            }
+            let mut score = similarity(&name, t);
+            let (_, c_season) = title_key(t);
+            match (want_season, c_season) {
+                (Some(a), Some(b)) if a == b => score += 0.35,
+                (Some(a), Some(b)) if a != b => score -= 0.9,
+                (Some(_), None) => score -= 0.5,
+                _ => {}
+            }
+            if score <= 0.0 {
+                return None;
+            }
+            Some((score, c.clone()))
+        })
+        .collect();
+    ranked.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+
+    let top = ranked.first().map(|(_, c)| c).ok_or_else(|| {
+        format!("anime \"{name}\" tidak ditemukan di Samehadaku")
+    })?;
+    let best_score = ranked.first().map(|(s, _)| *s).unwrap_or(0.0);
+    if best_score < 0.55 {
+        return Err(format!(
+            "anime \"{name}\" tidak cocok di Samehadaku (kecocokan terbaik {:.0}%)",
+            best_score * 100.0
+        ));
+    }
+    let anime_url = top["url"].as_str().unwrap_or("").to_string();
+    if anime_url.is_empty() {
+        return Err("URL anime Samehadaku kosong".to_string());
+    }
+    let anime_title = top["title"].as_str().unwrap_or(&name).to_string();
+
+    let (ep_url, matched, available) = {
+        let ah = get_html(s, &anime_url)
+            .await
+            .map_err(|e| format!("halaman anime Samehadaku gagal: {e}"))?;
         let list = if is_how(&ah) { anime_how(&ah) } else { anime_li(&ah) };
         let episodes = list["episodes"].as_array().cloned().unwrap_or_default();
-        let target = episodes.iter()
-            .find(|e| e["num"].as_u64().unwrap_or(0) == num)
-            .or_else(|| episodes.last())
-            .ok_or_else(|| "daftar episode Samehadaku kosong".to_string())?;
-        let url = target["url"].as_str().unwrap_or("").to_string();
-        if url.is_empty() {
-            return Err("URL episode Samehadaku kosong".to_string());
+        if episodes.is_empty() {
+            return Err("daftar episode Samehadaku kosong".to_string());
         }
-        (url, target["num"].clone())
+        let available: Vec<u64> = episodes
+            .iter()
+            .map(|e| e["num"].as_u64().unwrap_or(0))
+            .filter(|n| *n > 0)
+            .collect();
+        let target = if num > 0 {
+            episodes
+                .iter()
+                .find(|e| e["num"].as_u64().unwrap_or(0) == num)
+                .cloned()
+        } else {
+            None
+        };
+        match target {
+            Some(t) => {
+                let u = t["url"].as_str().unwrap_or("").to_string();
+                if u.is_empty() {
+                    return Err("URL episode Samehadaku kosong".to_string());
+                }
+                (u, num, available)
+            }
+            None => {
+                let max = available.iter().copied().max().unwrap_or(0);
+                return Err(if num > 0 {
+                    format!(
+                        "Episode {num} \"{anime_title}\" belum tersedia di Samehadaku (tersedia sampai episode {max})"
+                    )
+                } else {
+                    format!("episode untuk \"{anime_title}\" tidak ditemukan di Samehadaku")
+                });
+            }
+        }
     };
 
     let mut data = {
-        let eh = get_html(s, &ep_url).await.map_err(|e| format!("halaman episode Samehadaku gagal: {e}"))?;
+        let eh = get_html(s, &ep_url)
+            .await
+            .map_err(|e| format!("halaman episode Samehadaku gagal: {e}"))?;
         let mut d = if is_how(&eh) { episode_how(&eh) } else { episode_li(&eh) };
         d["theme"] = json!(theme_of(&eh));
         d
     };
     if data["title"].as_str().map(str::is_empty).unwrap_or(true) {
-        data["title"] = json!(clean);
+        data["title"] = json!(title);
     }
     data["url"] = json!(ep_url);
     data["anime_url"] = json!(anime_url);
-    data["matched_episode"] = matched;
+    data["anime_title"] = json!(anime_title);
+    data["matched_episode"] = json!(matched);
+    data["requested_episode"] = json!(num);
+    data["available_episodes"] = json!(available);
     Ok(data)
 }
 
