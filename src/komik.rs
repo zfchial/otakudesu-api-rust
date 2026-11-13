@@ -5,7 +5,7 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use std::sync::Arc;
 
-use crate::{err, AppState, UA};
+use crate::{err, AppState};
 
 const KOMIK: &str = "https://komikindo.ch";
 const KOMIK_UA: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
@@ -57,11 +57,6 @@ fn clean(u: &str) -> String {
     let u = u.split('"').next().unwrap_or(u).trim();
     let u = u.replace(' ', "%20");
     abs_url(&u)
-}
-
-fn slug_from(url: &str) -> String {
-    let p = url.split('/').filter(|s| !s.is_empty()).last().unwrap_or("");
-    p.to_string()
 }
 
 fn text_of(doc: &Html, s: &str) -> Option<String> {
@@ -379,8 +374,4 @@ async fn komik_reader_data(s: &AppState, q: &ComicQuery) -> Result<Value, String
 pub async fn komik_health(State(s): State<Arc<AppState>>) -> Response {
     let ok = fetch(&s, &format!("{}/", KOMIK)).await.is_ok();
     axum::Json(json!({"ok":true,"data":{"source":"komikindo","available":ok,"base_url":KOMIK}})).into_response()
-}
-
-pub fn _unused(_: &str) -> &str {
-    UA
 }
