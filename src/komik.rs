@@ -115,11 +115,20 @@ async fn komik_home_data(s: &AppState) -> Result<Value, String> {
             })
             .take(4)
             .collect::<Vec<_>>();
+        let kind = el
+            .select(&sel("span[class*='typeflag']"))
+            .next()
+            .map(|s| {
+                let c = s.value().attr("class").unwrap_or_default();
+                c.split_whitespace().last().unwrap_or_default().to_string()
+            })
+            .filter(|k| !k.is_empty());
         out.push(json!({
             "title": title,
             "url": link,
             "cover": cover,
-            "chapters": chapters
+            "chapters": chapters,
+            "kind": kind
         }));
         if out.len() >= 24 {
             break;
@@ -176,15 +185,24 @@ async fn komik_search_data(s: &AppState, q: &ComicQuery) -> Result<Value, String
             .and_then(|i| i.value().attr("data-src").or_else(|| i.value().attr("src")))
             .map(clean);
         let genres = el
-            .select(&sel("div.genreed, .genxed a, a[href*='/konten/']"))
+            .select(&sel("a[href*='/genres/'], div.genreed a, .genxed a"))
             .map(|a| a.text().collect::<String>().trim().to_string())
             .filter(|t| !t.is_empty() && t.len() < 30)
             .collect::<Vec<_>>();
+        let kind = el
+            .select(&sel("span[class*='typeflag']"))
+            .next()
+            .map(|s| {
+                let c = s.value().attr("class").unwrap_or_default();
+                c.split_whitespace().last().unwrap_or_default().to_string()
+            })
+            .filter(|k| !k.is_empty());
         items.push(json!({
             "title": title,
             "url": link,
             "cover": cover,
-            "genres": genres
+            "genres": genres,
+            "kind": kind
         }));
         if items.len() >= 30 {
             break;
@@ -227,7 +245,7 @@ async fn komik_detail_data(s: &AppState, q: &ComicQuery) -> Result<Value, String
         .map(clean);
     let description = text_of(&doc, "div.desc, .entry-content p, .sinopsis");
     let genres = doc
-        .select(&sel("a[href*='/konten/'], .genxed a, .genre a"))
+        .select(&sel("div.genre-info a, a[href*='/genres/'], .genxed a, .genre a"))
         .map(|a| a.text().collect::<String>().trim().to_string())
         .filter(|t| !t.is_empty() && t.len() < 30)
         .collect::<std::collections::BTreeSet<_>>()
@@ -368,6 +386,159 @@ async fn komik_reader_data(s: &AppState, q: &ComicQuery) -> Result<Value, String
         "prev": prev,
         "next": next,
         "series": series
+    }))
+}
+
+pub async fn komik_genres(State(s): State<Arc<AppState>>) -> Response {
+    match komik_genres_data(&s).await {
+        Ok(v) => axum::Json(json!({"ok":true,"data":v})).into_response(),
+        Err(e) => err(e).into_response(),
+    }
+}
+
+async fn komik_genres_data(s: &AppState) -> Result<Value, String> {
+    let html = fetch(s, &format!("{}/genres-sitemap.xml", KOMIK)).await?;
+    let mut genres = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for part in html.split("<loc>").skip(1) {
+        let loc = part.split("</loc>").next().unwrap_or_default().trim();
+        if !loc.starts_with(&format!("{}/genres/", KOMIK)) {
+            continue;
+        }
+        let slug = loc
+            .trim_start_matches(&format!("{}/genres/", KOMIK))
+            .trim_end_matches('/')
+            .to_string();
+        if slug.is_empty() || !seen.insert(slug.clone()) {
+            continue;
+        }
+        let label = slug
+            .split('-')
+            .map(|w| {
+                let mut c = w.chars();
+                match c.next() {
+                    Some(f) => f.to_uppercase().collect::<String>() + c.as_str(),
+                    None => String::new(),
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(" ");
+        genres.push(json!({"name": label, "slug": slug}));
+    }
+    Ok(json!({"genres": genres, "total": genres.len()}))
+}
+
+pub async fn komik_by_genre(
+    State(s): State<Arc<AppState>>,
+    Query(q): Query<ComicQuery>,
+) -> Response {
+    match komik_by_genre_data(&s, &q).await {
+        Ok(v) => axum::Json(json!({"ok":true,"data":v})).into_response(),
+        Err(e) => err(e).into_response(),
+    }
+}
+
+async fn komik_by_genre_data(s: &AppState, q: &ComicQuery) -> Result<Value, String> {
+    let slug = q
+        .slug
+        .clone()
+        .or_else(|| q.q.clone())
+        .ok_or("Parameter slug genre wajib diisi")?
+        .trim()
+        .trim_matches('/')
+        .to_string();
+    if slug.is_empty() || !slug.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') {
+        return Err("Slug genre tidak valid".to_string());
+    }
+    let page = q.page.unwrap_or(1).max(1);
+    let base = format!("{}/genres/{}/", KOMIK, slug);
+    let url = if page > 1 {
+        format!("{}page/{}/", base, page)
+    } else {
+        base
+    };
+    let html = fetch(s, &url).await?;
+    let doc = Html::parse_document(&html);
+    let label = slug
+        .split('-')
+        .map(|w| {
+            let mut c = w.chars();
+            match c.next() {
+                Some(f) => f.to_uppercase().collect::<String>() + c.as_str(),
+                None => String::new(),
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
+    let mut items = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for el in doc.select(&sel("div.animepost, article, div.bs, div.utao")) {
+        let link = el
+            .select(&sel("a[href*='/komik/']"))
+            .next()
+            .and_then(|a| a.value().attr("href"))
+            .map(abs_url);
+        let Some(link) = link else { continue };
+        if !seen.insert(link.clone()) {
+            continue;
+        }
+        let title = el
+            .select(&sel("h3 a, h2 a, h4 a, .tt"))
+            .next()
+            .map(|a| a.text().collect::<String>().trim().to_string())
+            .filter(|t| !t.is_empty())
+            .or_else(|| {
+                el.select(&sel("a[href*='/komik/']"))
+                    .next()
+                    .and_then(|a| a.value().attr("title"))
+                    .map(|t| t.trim().to_string())
+            });
+        let Some(title) = title else { continue };
+        let cover = el
+            .select(&sel("img"))
+            .next()
+            .and_then(|i| i.value().attr("data-src").or_else(|| i.value().attr("src")))
+            .map(clean);
+        let genres = el
+            .select(&sel("a[href*='/genres/'], div.genreed a, .genxed a"))
+            .map(|a| a.text().collect::<String>().trim().to_string())
+            .filter(|t| !t.is_empty() && t.len() < 30)
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
+        let genres = if genres.is_empty() {
+            vec![label.clone()]
+        } else {
+            genres
+        };
+        let kind = el
+            .select(&sel("span[class*='typeflag']"))
+            .next()
+            .map(|s| {
+                let c = s.value().attr("class").unwrap_or_default();
+                c.split_whitespace()
+                    .last()
+                    .unwrap_or_default()
+                    .to_string()
+            })
+            .filter(|k| !k.is_empty());
+        items.push(json!({
+            "title": title,
+            "url": link,
+            "cover": cover,
+            "genres": genres,
+            "kind": kind
+        }));
+        if items.len() >= 30 {
+            break;
+        }
+    }
+    Ok(json!({
+        "slug": slug,
+        "label": label,
+        "page": page,
+        "items": items,
+        "total": items.len()
     }))
 }
 
