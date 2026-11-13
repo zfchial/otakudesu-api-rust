@@ -1,4 +1,6 @@
 use axum::extract::{Query, State};
+use axum::body::Body;
+use axum::http::{header, StatusCode};
 use axum::response::{IntoResponse, Response};
 use scraper::{Html, Selector};
 use serde::Deserialize;
@@ -18,26 +20,87 @@ pub struct ComicQuery {
     pub limit: Option<usize>,
     pub slug: Option<String>,
     pub chapter: Option<String>,
+    pub kind: Option<String>,
+    pub sort: Option<String>,
 }
 
 fn sel(s: &str) -> Selector {
     Selector::parse(s).unwrap()
 }
 
+fn cache() -> &'static std::sync::Mutex<std::collections::HashMap<String, (std::time::Instant, String)>> {
+    static CACHE: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<String, (std::time::Instant, String)>>> = std::sync::OnceLock::new();
+    CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+fn cached_get(key: &str) -> Option<String> {
+    let map = cache().lock().ok()?;
+    let (at, body) = map.get(key)?;
+    if at.elapsed().as_secs() < 600 {
+        Some(body.clone())
+    } else {
+        None
+    }
+}
+
+pub async fn komik_image(State(s): State<Arc<AppState>>, Query(q): Query<ComicQuery>) -> Response {
+    let Some(url) = q.url else {
+        return err("URL gambar wajib diisi").into_response();
+    };
+    if !url.starts_with(KOMIK) || !url.starts_with("https://") {
+        return err("URL gambar komik tidak valid").into_response();
+    }
+    match s.client.get(&url).header("User-Agent", KOMIK_UA).header("Referer", KOMIK).send().await {
+        Ok(r) if r.status().is_success() => {
+            let ct = r.headers().get(header::CONTENT_TYPE).and_then(|v| v.to_str().ok()).unwrap_or("image/jpeg").to_string();
+            match r.bytes().await {
+                Ok(bytes) => Response::builder()
+                    .status(StatusCode::OK)
+                    .header(header::CONTENT_TYPE, ct)
+                    .header(header::CACHE_CONTROL, "public, max-age=86400")
+                    .body(Body::from(bytes))
+                    .unwrap(),
+                Err(e) => err(e.to_string()).into_response(),
+            }
+        }
+        Ok(r) => err(format!("Gambar upstream gagal: {}", r.status())).into_response(),
+        Err(e) => err(e.to_string()).into_response(),
+    }
+}
+
+fn cached_put(key: &str, body: String) {
+    if let Ok(mut map) = cache().lock() {
+        if map.len() > 120 {
+            map.clear();
+        }
+        map.insert(key.to_string(), (std::time::Instant::now(), body));
+    }
+}
+
 async fn fetch(s: &AppState, url: &str) -> Result<String, String> {
+    if let Some(body) = cached_get(url) {
+        return Ok(body);
+    }
     let r = s
         .client
         .get(url)
         .header("User-Agent", KOMIK_UA)
-        .header("Accept", "text/html,application/xhtml+xml")
+        .header("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
         .header("Referer", KOMIK)
         .send()
         .await
         .map_err(|e| e.to_string())?;
     if !r.status().is_success() {
+        if let Ok(map) = cache().lock() {
+            if let Some((_, body)) = map.get(url) {
+                return Ok(body.clone());
+            }
+        }
         return Err(format!("Upstream komik status {}", r.status()));
     }
-    r.text().await.map_err(|e| e.to_string())
+    let body = r.text().await.map_err(|e| e.to_string())?;
+    cached_put(url, body.clone());
+    Ok(body)
 }
 
 fn abs_url(u: &str) -> String {
@@ -244,6 +307,52 @@ async fn komik_detail_data(s: &AppState, q: &ComicQuery) -> Result<Value, String
         .and_then(|i| i.value().attr("data-src").or_else(|| i.value().attr("src")))
         .map(clean);
     let description = text_of(&doc, "div.desc, .entry-content p, .sinopsis");
+    let mut info = std::collections::HashMap::new();
+    for span in doc.select(&sel(".infox .spe > span, .spe > span")) {
+        let label = span
+            .select(&sel("b"))
+            .next()
+            .map(|b| b.text().collect::<String>())
+            .unwrap_or_default()
+            .trim()
+            .trim_end_matches(':')
+            .to_lowercase();
+        let value = span
+            .text()
+            .collect::<String>()
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        let value = value
+            .split_once(':')
+            .map(|(_, v)| v.trim().to_string())
+            .unwrap_or(value);
+        if !label.is_empty() && !value.is_empty() {
+            info.insert(label, value);
+        }
+    }
+    let status = info.get("status").cloned();
+    let author = info
+        .get("pengarang")
+        .or_else(|| info.get("author"))
+        .cloned();
+    let kind = info.get("jenis komik").cloned();
+    let mut released = doc
+        .select(&sel("meta[property='article:published_time'], meta[itemprop='datePublished']"))
+        .next()
+        .and_then(|m| {
+            m.value()
+                .attr("content")
+                .or_else(|| m.value().attr("datetime"))
+                .map(|v| v.chars().take(10).collect::<String>())
+        });
+    if released.is_none() {
+        released = html.split("\"datePublished\":\"").nth(1).and_then(|v| {
+            v.split('"')
+                .next()
+                .map(|v| v.chars().take(10).collect::<String>())
+        });
+    }
     let genres = doc
         .select(&sel("div.genre-info a, a[href*='/genres/'], .genxed a, .genre a"))
         .map(|a| a.text().collect::<String>().trim().to_string())
@@ -287,7 +396,11 @@ async fn komik_detail_data(s: &AppState, q: &ComicQuery) -> Result<Value, String
         "description": description,
         "genres": genres,
         "chapters": chapters,
-        "total_chapters": chapters.len()
+        "total_chapters": chapters.len(),
+        "status": status,
+        "author": author,
+        "kind": kind,
+        "released": released
     }))
 }
 
@@ -553,6 +666,34 @@ async fn komik_by_genre_data(s: &AppState, q: &ComicQuery) -> Result<Value, Stri
         if items.len() >= 30 {
             break;
         }
+    }
+    let kind = q
+        .kind
+        .clone()
+        .unwrap_or_default()
+        .trim()
+        .to_lowercase();
+    if !kind.is_empty() && kind != "all" {
+        items.retain(|i| {
+            i.get("kind")
+                .and_then(|v| v.as_str())
+                .map(|v| v.eq_ignore_ascii_case(&kind))
+                .unwrap_or(false)
+        });
+    }
+    if q.sort.as_deref() == Some("title") {
+        items.sort_by(|a, b| {
+            a.get("title")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_lowercase()
+                .cmp(
+                    &b.get("title")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or_default()
+                        .to_lowercase(),
+                )
+        });
     }
     Ok(json!({
         "slug": slug,
